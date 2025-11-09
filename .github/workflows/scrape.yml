@@ -26,6 +26,8 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add opinion.xml world.xml daily_kalerkantho_part1.xml daily_kalerkantho_part2.xml
+          git add --ignore-missing opinion.xml
+          git add --ignore-missing world.xml
+          git add --ignore-missing daily_kalerkantho_part*.xml
           git commit -m "update feeds" || echo "no changes"
           git push
