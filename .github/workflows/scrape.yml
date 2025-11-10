@@ -17,15 +17,17 @@ jobs:
           python-version: '3.x'
 
       - name: Install dependencies
-        run: pip install feedparser
+        run: |
+          pip install feedparser
 
       - name: Run scraper
-        run: python scrape.py
+        run: |
+          python scrape.py
 
-      - name: Commit and push
+      - name: Commit and push updates
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add opinion.xml world.xml daily_kalerkantho_part1.xml daily_kalerkantho_part2.xml
+          git add opinion.xml world.xml daily_kalerkantho_part1.xml daily_kalerkantho_part2.xml daily_last_seen.json
           git commit -m "update feeds" || echo "no changes"
           git push
