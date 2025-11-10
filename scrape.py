@@ -1,4 +1,3 @@
-# scrape.py
 import feedparser
 import xml.etree.ElementTree as ET
 import os
@@ -6,6 +5,7 @@ from datetime import datetime
 import calendar
 import email.utils
 import time
+import json
 
 SRC = "https://www.kalerkantho.com/rss.xml"
 FILES = {
@@ -191,5 +191,51 @@ wr_entries = [e for e in feed.entries if ("/world/" in ((getattr(e,"link",None) 
 merge_update_feed(wr_root, wr_entries)
 ET.ElementTree(wr_root).write(FILES["world"], encoding="utf-8", xml_declaration=True)
 
+# BEGIN LAST_SEEN FILTER FOR PRINT EDITION
+LAST_SEEN_FILE = "daily_last_seen.json"
+
+try:
+    with open(LAST_SEEN_FILE, "r", encoding="utf-8") as f:
+        last_seen = json.load(f)
+except Exception:
+    last_seen = {}
+
+def normalize_link(link):
+    if not link:
+        return ""
+    link = link.strip()
+    if "?" in link:
+        link = link.split("?", 1)[0]
+    if "#" in link:
+        link = link.split("#", 1)[0]
+    return link.rstrip("/")
+
 print_entries = [e for e in feed.entries if "/print-edition/" in ((getattr(e,"link",None) or getattr(e,"id",None) or "").strip())]
-add_items_print(print_entries, FILES["print_parts"])
+new_print_entries = []
+
+for e in print_entries:
+    raw_link = getattr(e, "link", None) or getattr(e, "id", None) or ""
+    link = normalize_link(raw_link)
+    if not link:
+        continue
+    pd = get_entry_pubdt(e)
+    last_dt_str = last_seen.get(link)
+    try:
+        last_dt = datetime.fromisoformat(last_dt_str) if last_dt_str else datetime.min
+    except Exception:
+        last_dt = datetime.min
+    if pd > last_dt:
+        new_print_entries.append(e)
+        try:
+            last_seen[link] = pd.isoformat()
+        except Exception:
+            last_seen[link] = pd.strftime("%Y-%m-%dT%H:%M:%S")
+
+add_items_print(new_print_entries, FILES["print_parts"])
+
+try:
+    with open(LAST_SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(last_seen, f, ensure_ascii=False, indent=2)
+except Exception:
+    pass
+# END LAST_SEEN FILTER FOR PRINT EDITION
