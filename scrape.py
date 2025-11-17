@@ -108,30 +108,52 @@ def normalize_link(link):
     return link.rstrip("/")
 
 def add_items_print(entries, paths):
+    # load existing items from both xmls
     seen = {}
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        root = ET.parse(p).getroot()
+        ch = root.find("channel")
+        if not ch:
+            continue
+        for item in ch.findall("item"):
+            link = (item.findtext("link") or "").strip()
+            if not link:
+                continue
+            title = item.findtext("title") or ""
+            pd_text = item.findtext("pubDate") or ""
+            try:
+                pd = email.utils.parsedate_to_datetime(pd_text).replace(tzinfo=None)
+            except:
+                try:
+                    pd = datetime.strptime(pd_text, "%a, %d %b %Y %H:%M:%S GMT")
+                except:
+                    pd = datetime.min
+            if link not in seen or pd > seen[link]["pubDate"]:
+                seen[link] = {"title": title, "pubDate": pd}
 
-    # merge new entries — no old-file loading; overwrite behavior enforced
-    for entry in entries:
-        raw = getattr(entry, "link", None) or getattr(entry, "id", None) or ""
+    # merge new entries
+    for e in entries:
+        raw = getattr(e, "link", None) or getattr(e, "id", None) or ""
         link = normalize_link(raw)
         if not link:
             continue
-        pd = get_entry_pubdt(entry)
-        title = getattr(entry, "title", "")
+        pd = get_entry_pubdt(e)
+        title = getattr(e, "title", "")
         if link not in seen or pd > seen[link]["pubDate"]:
             seen[link] = {"title": title, "pubDate": pd}
 
-    # newest first
+    # newest first, cap 500
     items = sorted(
         [{"link": k, "title": v["title"], "pubDate": v["pubDate"]} for k,v in seen.items()],
         key=lambda x: x["pubDate"], reverse=True
-    )
+    )[:500]
 
-    # split into first 100 and overflow
-    part1 = items[:100]
-    part2 = items[100:200]
+    # write back appended form: first 100 to part1, next 100 to part2
+    chunks = [items[:100], items[100:200]]
 
-    def write_part(path, chunk):
+    for idx, chunk in enumerate(chunks):
         root = ET.Element("rss", version="2.0")
         ch = ET.SubElement(root, "channel")
         for it in chunk:
@@ -140,26 +162,47 @@ def add_items_print(entries, paths):
             ET.SubElement(item, "link").text = it["link"]
             ET.SubElement(item, "pubDate").text = format_pubdate(it["pubDate"])
             ET.SubElement(item, "guid", isPermaLink="false").text = it["link"]
-        ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+        ET.ElementTree(root).write(paths[idx], encoding="utf-8", xml_declaration=True)
 
-    # always overwrite
-    write_part(paths[0], part1)
-    write_part(paths[1], part2)
+    # remove extra part files if needed
+    for j in range(len(chunks), len(paths)):
+        if os.path.exists(paths[j]):
+            os.remove(paths[j])
 
 # -----------------------------
 # MAIN
 # -----------------------------
 feed = feedparser.parse(SRC)
 
+# opinion (exclude print edition)
+op_print_links = set()
+for p in FILES["print_parts"]:
+    if os.path.exists(p):
+        root_tmp = ET.parse(p).getroot()
+        ch_tmp = root_tmp.find("channel")
+        if ch_tmp:
+            for it in ch_tmp.findall("item"):
+                ln = it.findtext("link")
+                if ln:
+                    op_print_links.add(ln.strip())
+
 # opinion
 op_root = load_existing(FILES["opinion"])
-op_entries = [e for e in feed.entries if any(x in (getattr(e,"link","") or "") for x in ["/opinion/","/editorial/","/sub-editorial/"])]
+op_entries = [
+    e for e in feed.entries
+    if any(x in (getattr(e, "link", "") or "") for x in ["/opinion/","/editorial/","/sub-editorial/"])
+    and (getattr(e, "link", "") or "").strip() not in op_print_links
+])]
 merge_update_feed(op_root, op_entries)
 ET.ElementTree(op_root).write(FILES["opinion"], encoding="utf-8", xml_declaration=True)
 
 # world
 wr_root = load_existing(FILES["world"])
-wr_entries = [e for e in feed.entries if any(x in (getattr(e,"link","") or "") for x in ["/world/","/deshe-deshe/"])]
+wr_entries = [
+    e for e in feed.entries
+    if any(x in (getattr(e, "link", "") or "") for x in ["/world/","/deshe-deshe/"])
+    and (getattr(e, "link", "") or "").strip() not in op_print_links
+])]
 merge_update_feed(wr_root, wr_entries)
 ET.ElementTree(wr_root).write(FILES["world"], encoding="utf-8", xml_declaration=True)
 
