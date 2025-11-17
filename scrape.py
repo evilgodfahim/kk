@@ -12,6 +12,7 @@ FILES = {
     "world": "world.xml",
     "print_parts": ["daily_kalerkantho_part1.xml", "daily_kalerkantho_part2.xml"]
 }
+PRINT_TRACKER = "print_articles_tracker.json"
 
 # -----------------------------
 # Utility
@@ -94,7 +95,7 @@ def merge_update_feed(root, entries):
         channel.remove(extra)
 
 # -----------------------------
-# Print edition logic
+# Print edition logic with tracker
 # -----------------------------
 def normalize_link(link):
     if not link:
@@ -103,11 +104,27 @@ def normalize_link(link):
     link = link.split("?",1)[0].split("#",1)[0]
     return link.rstrip("/")
 
-def add_items_print(entries, paths):
-    seen = {}
+def load_tracker():
+    """Load the tracker JSON that remembers which file each article belongs to"""
+    if os.path.exists(PRINT_TRACKER):
+        try:
+            with open(PRINT_TRACKER, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
 
-    # Load existing items from both xmls
-    for p in paths:
+def save_tracker(tracker):
+    """Save the tracker JSON"""
+    with open(PRINT_TRACKER, 'w', encoding='utf-8') as f:
+        json.dump(tracker, f, ensure_ascii=False, indent=2)
+
+def add_items_print(entries, paths):
+    # Load tracker - format: {link: {"file_index": 0 or 1, "title": "...", "pubDate": "..."}}
+    tracker = load_tracker()
+    
+    # Load existing items from both XMLs and update tracker
+    for idx, p in enumerate(paths):
         if not os.path.exists(p):
             continue
         root = ET.parse(p).getroot()
@@ -115,7 +132,7 @@ def add_items_print(entries, paths):
         if not ch:
             continue
         for item in ch.findall("item"):
-            link = (item.findtext("link") or "").strip()
+            link = normalize_link(item.findtext("link") or "")
             if not link:
                 continue
             title = item.findtext("title") or ""
@@ -127,30 +144,120 @@ def add_items_print(entries, paths):
                     pd = datetime.strptime(pd_text, "%a, %d %b %Y %H:%M:%S GMT")
                 except:
                     pd = datetime.min
-            if link not in seen or pd > seen[link]["pubDate"]:
-                seen[link] = {"title": title, "pubDate": pd}
+            
+            # If link already in tracker, keep its original file assignment
+            if link not in tracker:
+                tracker[link] = {
+                    "file_index": idx,
+                    "title": title,
+                    "pubDate": pd.isoformat()
+                }
+            else:
+                # Update title and pubDate if newer, but keep file_index
+                try:
+                    existing_pd = datetime.fromisoformat(tracker[link]["pubDate"])
+                    if pd > existing_pd:
+                        tracker[link]["title"] = title
+                        tracker[link]["pubDate"] = pd.isoformat()
+                except:
+                    pass
 
-    # Merge new entries
+    # Process new entries from feed
+    new_articles = []
     for e in entries:
         raw = getattr(e, "link", None) or getattr(e, "id", None) or ""
         link = normalize_link(raw)
         if not link:
             continue
-        pd = get_entry_pubdt(e)
-        title = getattr(e, "title", "")
-        if link not in seen or pd > seen[link]["pubDate"]:
-            seen[link] = {"title": title, "pubDate": pd}
-
-    # Sort newest first, cap 500
-    items = sorted(
-        [{"link": k, "title": v["title"], "pubDate": v["pubDate"]} for k,v in seen.items()],
-        key=lambda x: x["pubDate"], reverse=True
-    )[:500]
-
-    # Split: first 100 strictly in part1, remaining in part2 (any count)
-    part1 = items[:100]
-    part2 = items[100:]
-
+        
+        # Only add if NOT already in tracker (truly new article)
+        if link not in tracker:
+            pd = get_entry_pubdt(e)
+            title = getattr(e, "title", "")
+            new_articles.append({
+                "link": link,
+                "title": title,
+                "pubDate": pd
+            })
+    
+    # Sort new articles by date (newest first)
+    new_articles.sort(key=lambda x: x["pubDate"], reverse=True)
+    
+    # Assign new articles to files
+    # Count current items in each file
+    file_counts = [0, 0]
+    for link, data in tracker.items():
+        file_idx = data.get("file_index", 0)
+        if file_idx < len(file_counts):
+            file_counts[file_idx] += 1
+    
+    # Add new articles - fill part1 first (up to 100), rest go to part2
+    for article in new_articles:
+        if file_counts[0] < 100:
+            target_file = 0
+        else:
+            target_file = 1
+        
+        tracker[article["link"]] = {
+            "file_index": target_file,
+            "title": article["title"],
+            "pubDate": article["pubDate"].isoformat()
+        }
+        file_counts[target_file] += 1
+    
+    # Build items for each file from tracker
+    file_items = [[], []]
+    for link, data in tracker.items():
+        file_idx = data.get("file_index", 0)
+        if file_idx < len(file_items):
+            try:
+                pd = datetime.fromisoformat(data["pubDate"])
+            except:
+                pd = datetime.min
+            file_items[file_idx].append({
+                "link": link,
+                "title": data["title"],
+                "pubDate": pd
+            })
+    
+    # Sort each file's items by date (newest first) and cap at 500 total
+    for items in file_items:
+        items.sort(key=lambda x: x["pubDate"], reverse=True)
+    
+    # Apply 500 item cap across both files (remove oldest)
+    all_tracked = []
+    for idx, items in enumerate(file_items):
+        for item in items:
+            all_tracked.append((item, idx))
+    
+    all_tracked.sort(key=lambda x: x[0]["pubDate"], reverse=True)
+    
+    if len(all_tracked) > 500:
+        # Remove oldest items from tracker
+        for item_data, file_idx in all_tracked[500:]:
+            link = item_data["link"]
+            if link in tracker:
+                del tracker[link]
+        
+        # Rebuild file_items after cleanup
+        file_items = [[], []]
+        for link, data in tracker.items():
+            file_idx = data.get("file_index", 0)
+            if file_idx < len(file_items):
+                try:
+                    pd = datetime.fromisoformat(data["pubDate"])
+                except:
+                    pd = datetime.min
+                file_items[file_idx].append({
+                    "link": link,
+                    "title": data["title"],
+                    "pubDate": pd
+                })
+        
+        for items in file_items:
+            items.sort(key=lambda x: x["pubDate"], reverse=True)
+    
+    # Write files
     def write_part(path, chunk):
         root = ET.Element("rss", version="2.0")
         ch = ET.SubElement(root, "channel")
@@ -161,14 +268,18 @@ def add_items_print(entries, paths):
             ET.SubElement(item, "pubDate").text = format_pubdate(it["pubDate"])
             ET.SubElement(item, "guid", isPermaLink="false").text = it["link"]
         ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
-
-    write_part(paths[0], part1)
-    write_part(paths[1], part2)
-
+    
+    for idx, path in enumerate(paths):
+        write_part(path, file_items[idx])
+    
+    # Save tracker
+    save_tracker(tracker)
+    
     # Remove extra old part files if any
-    for j in range(2, len(paths)):
-        if os.path.exists(paths[j]):
-            os.remove(paths[j])
+    for j in range(2, 10):  # Check up to 10 potential old files
+        old_path = f"daily_kalerkantho_part{j+1}.xml"
+        if os.path.exists(old_path):
+            os.remove(old_path)
 
 # -----------------------------
 # MAIN
