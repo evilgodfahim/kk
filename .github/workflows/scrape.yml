@@ -28,6 +28,6 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add opinion.xml world.xml daily_kalerkantho_part1.xml daily_kalerkantho_part2.xml daily_last_seen.json
+          git add opinion.xml world.xml daily_kalerkantho_part1.xml daily_kalerkantho_part2.xml daily_last_seen.json print_articles_tracker.json
           git commit -m "update feeds" || echo "no changes"
           git push
