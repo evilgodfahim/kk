@@ -1,241 +1,128 @@
-import feedparser
-import xml.etree.ElementTree as ET
-import os
-from datetime import datetime
-import calendar
-import email.utils
-import time
-import json
+Revised script based strictly on the requirement:
 
-SRC = "https://www.kalerkantho.com/rss.xml"
-FILES = {
-    "opinion": "opinion.xml",
-    "world": "world.xml",
-    "print_parts": ["daily_kalerkantho_part1.xml", "daily_kalerkantho_part2.xml"]
-}
+"If articles exceed 100 in daily feed (print edition), overflow goes to second XML, never duplicated, always overwritten."
 
-def load_existing(path):
-    if not os.path.exists(path):
-        root = ET.Element("rss", version="2.0")
-        ET.SubElement(root, "channel")
-        return root
-    return ET.parse(path).getroot()
+File names unchanged: daily_kalerkantho_part1.xml, daily_kalerkantho_part2.xml
 
-def format_pubdate(dt):
-    return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+import feedparser import xml.etree.ElementTree as ET import os from datetime import datetime import calendar import email.utils import json
 
-def parse_struct_time(st):
-    return datetime.utcfromtimestamp(calendar.timegm(st))
+SRC = "https://www.kalerkantho.com/rss.xml" FILES = { "opinion": "opinion.xml", "world": "world.xml", "print_parts": ["daily_kalerkantho_part1.xml", "daily_kalerkantho_part2.xml"] }
 
-def get_entry_pubdt(entry):
-    pp = getattr(entry, "published_parsed", None)
-    if pp:
-        try:
-            return parse_struct_time(pp)
-        except:
-            pass
-    ps = getattr(entry, "published", None)
-    if ps:
-        try:
-            return email.utils.parsedate_to_datetime(ps).replace(tzinfo=None)
-        except:
-            pass
-    return datetime.utcnow()
+-----------------------------
 
-def get_item_pubdt(item):
-    txt = item.findtext("pubDate")
-    if not txt:
-        return datetime.min
-    try:
-        return email.utils.parsedate_to_datetime(txt).replace(tzinfo=None)
-    except:
-        try:
-            return datetime.strptime(txt, "%a, %d %b %Y %H:%M:%S GMT")
-        except:
-            return datetime.min
+Utility
 
-def merge_update_feed(root, entries):
-    channel = root.find("channel")
-    existing_map = {}
-    for item in channel.findall("item"):
-        link_text = item.findtext("link")
-        if link_text:
-            existing_map[link_text] = item
+-----------------------------
 
-    for entry in entries:
-        link = getattr(entry, "link", None) or getattr(entry, "id", None)
-        if not link:
-            continue
-        link = link.strip()
-        incoming_dt = get_entry_pubdt(entry)
+def load_existing(path): root = ET.Element("rss", version="2.0") ET.SubElement(root, "channel") return root
 
-        if link in existing_map:
-            item = existing_map[link]
-            existing_dt = get_item_pubdt(item)
-            if incoming_dt > existing_dt:
-                t = item.find("title")
-                if t is None:
-                    t = ET.SubElement(item, "title")
-                t.text = getattr(entry, "title", t.text)
+def format_pubdate(dt): return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
-                pd = item.find("pubDate")
-                if pd is None:
-                    pd = ET.SubElement(item, "pubDate")
-                pd.text = getattr(entry, "published", format_pubdate(incoming_dt))
+def parse_struct_time(st): return datetime.utcfromtimestamp(calendar.timegm(st))
 
-                g = item.find("guid")
-                if g is None:
-                    g = ET.SubElement(item, "guid", isPermaLink="false")
-                g.text = link
+def get_entry_pubdt(entry): pp = getattr(entry, "published_parsed", None) if pp: try: return parse_struct_time(pp) except: pass ps = getattr(entry, "published", None) if ps: try: return email.utils.parsedate_to_datetime(ps).replace(tzinfo=None) except: pass return datetime.utcnow()
 
-                channel.remove(item)
-                channel.insert(0, item)
-        else:
-            item = ET.Element("item")
-            ET.SubElement(item, "title").text = getattr(entry, "title", "")
-            ET.SubElement(item, "link").text = link
-            ET.SubElement(item, "pubDate").text = getattr(entry, "published", format_pubdate(incoming_dt))
-            ET.SubElement(item, "guid", isPermaLink="false").text = link
-            channel.insert(0, item)
-            existing_map[link] = item
+def get_item_pubdt(item): txt = item.findtext("pubDate") if not txt: return datetime.min try: return email.utils.parsedate_to_datetime(txt).replace(tzinfo=None) except: try: return datetime.strptime(txt, "%a, %d %b %Y %H:%M:%S GMT") except: return datetime.min
 
-    all_items = channel.findall("item")
-    if len(all_items) > 500:
-        for extra in all_items[500:]:
-            channel.remove(extra)
+def merge_update_feed(root, entries): channel = root.find("channel") existing = {}
 
-# ---------------------------
-# FIXED PRINT EDITION LOGIC
-# ---------------------------
-def add_items_print(entries, paths):
-    seen = {}  # link -> dict{title, pubDate}
+for item in channel.findall("item"):
+    link = item.findtext("link")
+    if link:
+        existing[link] = item
 
-    # load all existing parts into one map
-    for p in paths:
-        if not os.path.exists(p):
-            continue
-        root = ET.parse(p).getroot()
-        channel = root.find("channel")
-        if not channel:
-            continue
-        for item in channel.findall("item"):
-            link = (item.findtext("link") or "").strip()
-            if not link:
-                continue
-            title = item.findtext("title") or ""
-            pd_text = item.findtext("pubDate") or ""
-            try:
-                pd = email.utils.parsedate_to_datetime(pd_text).replace(tzinfo=None)
-            except:
-                try:
-                    pd = datetime.strptime(pd_text, "%a, %d %b %Y %H:%M:%S GMT")
-                except:
-                    pd = datetime.min
-            if link in seen:
-                if pd > seen[link]["pubDate"]:
-                    seen[link] = {"title": title, "pubDate": pd}
-            else:
-                seen[link] = {"title": title, "pubDate": pd}
-
-    # merge new entries
-    for entry in entries:
-        link = (getattr(entry, "link", None) or getattr(entry, "id", None) or "").strip()
-        if not link:
-            continue
-        pd = get_entry_pubdt(entry)
-        title = getattr(entry, "title", "")
-        if link in seen:
-            if pd > seen[link]["pubDate"]:
-                seen[link] = {"title": title, "pubDate": pd}
-        else:
-            seen[link] = {"title": title, "pubDate": pd}
-
-    # sort newest first and cap 500
-    items = sorted(
-        [{"link": k, "title": v["title"], "pubDate": v["pubDate"]} for k, v in seen.items()],
-        key=lambda x: x["pubDate"],
-        reverse=True
-    )[:500]
-
-    # 100-sized chunks
-    chunks = [items[i:i+100] for i in range(0, len(items), 100)]
-
-    # write chunks back
-    for i, chunk in enumerate(chunks):
-        path = paths[i] if i < len(paths) else f"daily_kalerkantho_part{i+1}.xml"
-        rss_root = ET.Element("rss", version="2.0")
-        channel = ET.SubElement(rss_root, "channel")
-        for it in chunk:
-            item = ET.SubElement(channel, "item")
-            ET.SubElement(item, "title").text = it["title"]
-            ET.SubElement(item, "link").text = it["link"]
-            ET.SubElement(item, "pubDate").text = format_pubdate(it["pubDate"])
-            ET.SubElement(item, "guid", isPermaLink="false").text = it["link"]
-        ET.ElementTree(rss_root).write(path, encoding="utf-8", xml_declaration=True)
-
-    # remove extra old part files
-    for j in range(len(chunks), len(paths)):
-        if os.path.exists(paths[j]):
-            os.remove(paths[j])
-
-# Main
-feed = feedparser.parse(SRC)
-
-op_root = load_existing(FILES["opinion"])
-op_entries = [e for e in feed.entries if any(x in ((getattr(e,"link",None) or getattr(e,"id",None) or "").strip()) for x in ["/opinion/","/editorial/","/sub-editorial/"])]
-merge_update_feed(op_root, op_entries)
-ET.ElementTree(op_root).write(FILES["opinion"], encoding="utf-8", xml_declaration=True)
-
-wr_root = load_existing(FILES["world"])
-wr_entries = [e for e in feed.entries if ("/world/" in ((getattr(e,"link",None) or getattr(e,"id",None) or "").strip()) or "/deshe-deshe/" in ((getattr(e,"link",None) or getattr(e,"id",None) or "").strip()))]
-merge_update_feed(wr_root, wr_entries)
-ET.ElementTree(wr_root).write(FILES["world"], encoding="utf-8", xml_declaration=True)
-
-# BEGIN LAST_SEEN FILTER FOR PRINT EDITION
-LAST_SEEN_FILE = "daily_last_seen.json"
-
-try:
-    with open(LAST_SEEN_FILE, "r", encoding="utf-8") as f:
-        last_seen = json.load(f)
-except Exception:
-    last_seen = {}
-
-def normalize_link(link):
-    if not link:
-        return ""
-    link = link.strip()
-    if "?" in link:
-        link = link.split("?", 1)[0]
-    if "#" in link:
-        link = link.split("#", 1)[0]
-    return link.rstrip("/")
-
-print_entries = [e for e in feed.entries if "/print-edition/" in ((getattr(e,"link",None) or getattr(e,"id",None) or "").strip())]
-new_print_entries = []
-
-for e in print_entries:
-    raw_link = getattr(e, "link", None) or getattr(e, "id", None) or ""
-    link = normalize_link(raw_link)
+for entry in entries:
+    link = getattr(entry, "link", None) or getattr(entry, "id", None)
     if not link:
         continue
-    pd = get_entry_pubdt(e)
-    last_dt_str = last_seen.get(link)
-    try:
-        last_dt = datetime.fromisoformat(last_dt_str) if last_dt_str else datetime.min
-    except Exception:
-        last_dt = datetime.min
-    if pd > last_dt:
-        new_print_entries.append(e)
-        try:
-            last_seen[link] = pd.isoformat()
-        except Exception:
-            last_seen[link] = pd.strftime("%Y-%m-%dT%H:%M:%S")
+    link = link.strip()
+    incoming_dt = get_entry_pubdt(entry)
 
-add_items_print(new_print_entries, FILES["print_parts"])
+    if link in existing:
+        item = existing[link]
+        if incoming_dt > get_item_pubdt(item):
+            item.find("title").text = getattr(entry, "title", item.find("title").text)
+            item.find("pubDate").text = getattr(entry, "published", format_pubdate(incoming_dt))
+            item.find("guid").text = link
+            channel.remove(item)
+            channel.insert(0, item)
+    else:
+        item = ET.Element("item")
+        ET.SubElement(item, "title").text = getattr(entry, "title", "")
+        ET.SubElement(item, "link").text = link
+        ET_Sub = ET.SubElement(item, "pubDate")
+        ET_Sub.text = getattr(entry, "published", format_pubdate(incoming_dt))
+        ET.SubElement(item, "guid", isPermaLink="false").text = link
+        channel.insert(0, item)
+        existing[link] = item
 
-try:
-    with open(LAST_SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(last_seen, f, ensure_ascii=False, indent=2)
-except Exception:
-    pass
-# END LAST_SEEN FILTER FOR PRINT EDITION
+# Cap to 500 (unchanged)
+all_items = channel.findall("item")
+for extra in all_items[500:]:
+    channel.remove(extra)
+
+-----------------------------
+
+PRINT FEED LOGIC (strict 100 + overflow)
+
+-----------------------------
+
+def normalize_link(link): if not link: return "" link = link.strip() link = link.split("?",1)[0].split("#",1)[0] return link.rstrip("/")
+
+def add_items_print(entries, paths): seen = {}
+
+# merge new entries — no old-file loading; overwrite behavior enforced
+for entry in entries:
+    raw = getattr(entry, "link", None) or getattr(entry, "id", None) or ""
+    link = normalize_link(raw)
+    if not link:
+        continue
+    pd = get_entry_pubdt(entry)
+    title = getattr(entry, "title", "")
+    if link not in seen or pd > seen[link]["pubDate"]:
+        seen[link] = {"title": title, "pubDate": pd}
+
+# newest first
+items = sorted(
+    [{"link": k, "title": v["title"], "pubDate": v["pubDate"]} for k,v in seen.items()],
+    key=lambda x: x["pubDate"], reverse=True
+)
+
+# split into first 100 and overflow
+part1 = items[:100]
+part2 = items[100:200]
+
+def write_part(path, chunk):
+    root = ET.Element("rss", version="2.0")
+    ch = ET.SubElement(root, "channel")
+    for it in chunk:
+        item = ET.SubElement(ch, "item")
+        ET.SubElement(item, "title").text = it["title"]
+        ET.SubElement(item, "link").text = it["link"]
+        ET.SubElement(item, "pubDate").text = format_pubdate(it["pubDate"])
+        ET.SubElement(item, "guid", isPermaLink="false").text = it["link"]
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+# always overwrite
+write_part(paths[0], part1)
+write_part(paths[1], part2)
+
+-----------------------------
+
+MAIN
+
+-----------------------------
+
+feed = feedparser.parse(SRC)
+
+opinion
+
+op_root = load_existing(FILES["opinion"]) op_entries = [e for e in feed.entries if any(x in (getattr(e,"link","") or "") for x in ["/opinion/","/editorial/","/sub-editorial/"])] merge_update_feed(op_root, op_entries) ET.ElementTree(op_root).write(FILES["opinion"], encoding="utf-8", xml_declaration=True)
+
+world
+
+wr_root = load_existing(FILES["world"]) wr_entries = [e for e in feed.entries if any(x in (getattr(e,"link","") or "") for x in ["/world/","/deshe-deshe/"])] merge_update_feed(wr_root, wr_entries) ET.ElementTree(wr_root).write(FILES["world"], encoding="utf-8", xml_declaration=True)
+
+print edition
+
+print_entries = [e for e in feed.entries if "/print-edition/" in (getattr(e,"link","") or "")] add_items_print(print_entries, FILES["print_parts"])
