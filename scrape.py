@@ -1,9 +1,3 @@
-Revised script based strictly on the requirement:
-
-"If articles exceed 100 in daily feed (print edition), overflow goes to second XML, never duplicated, always overwritten."
-
-File names unchanged: daily_kalerkantho_part1.xml, daily_kalerkantho_part2.xml
-
 import feedparser import xml.etree.ElementTree as ET import os from datetime import datetime import calendar import email.utils import json
 
 SRC = "https://www.kalerkantho.com/rss.xml" FILES = { "opinion": "opinion.xml", "world": "world.xml", "print_parts": ["daily_kalerkantho_part1.xml", "daily_kalerkantho_part2.xml"] }
