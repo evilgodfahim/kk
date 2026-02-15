@@ -8,6 +8,11 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      FLARE_URL: ${{ secrets.FLARE_URL }}
+      FLARE_API_KEY: ${{ secrets.FLARE_API_KEY }}
+      FLARE_SESSION: ${{ secrets.FLARE_SESSION }}
+      FLARE_MAX_TIMEOUT: "60000"
     steps:
       - uses: actions/checkout@v3
 
@@ -18,7 +23,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install feedparser
+          pip install --upgrade pip
+          pip install feedparser requests
 
       - name: Run scraper
         run: |
