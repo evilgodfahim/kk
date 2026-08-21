@@ -229,7 +229,7 @@ def add_items_print(entries, paths):
         except Exception:
             continue
         ch = root.find("channel")
-        if not ch:
+        if ch is None:                          # FIX: was `if not ch:`
             continue
         for item in ch.findall("item"):
             link = normalize_link(item.findtext("link") or "")
@@ -400,7 +400,7 @@ def main():
             try:
                 root_tmp = ET.parse(p).getroot()
                 ch_tmp = root_tmp.find("channel")
-                if ch_tmp:
+                if ch_tmp is not None:              # FIX: was `if ch_tmp:`
                     for it in ch_tmp.findall("item"):
                         ln = it.findtext("link")
                         if ln:
