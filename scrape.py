@@ -2,12 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Updated scrape.py with FlareSolverr integration and minor fixes:
-- Use FLARE_URL (e.g. http://127.0.0.1:8191/v1) to fetch pages via FlareSolverr when set
-- Respect optional FLARE_API_KEY (sent as X-Api-Key) and FLARE_SESSION (session id)
-- Fixed load_existing() to actually read existing files
-- Replaced deprecated utcfromtimestamp usage
-- Minimal changes; behavior falls back to direct requests when FLARE_URL not set
+scrape.py — Kaler Kantho RSS feed scraper.
+Fetches the main RSS feed directly via feedparser and splits entries into
+opinion, world, and print-edition XML files with a JSON tracker for dedup.
 """
 
 import os
@@ -16,7 +13,6 @@ import calendar
 import email.utils
 from datetime import datetime, timezone
 
-import requests
 import feedparser
 import xml.etree.ElementTree as ET
 
@@ -30,11 +26,6 @@ FILES = {
     "print_parts": ["daily_kalerkantho_part1.xml", "daily_kalerkantho_part2.xml"]
 }
 PRINT_TRACKER = "print_articles_tracker.json"
-# FlareSolverr config via env
-FLARE_URL = os.environ.get("FLARE_URL")  # e.g. http://127.0.0.1:8191/v1
-FLARE_API_KEY = os.environ.get("FLARE_API_KEY")
-FLARE_SESSION = os.environ.get("FLARE_SESSION")
-FLARE_MAX_TIMEOUT = int(os.environ.get("FLARE_MAX_TIMEOUT", "60000"))
 
 # -----------------------------
 # Utility
@@ -143,56 +134,6 @@ def merge_update_feed(root, entries):
     all_items = channel.findall("item")
     for extra in all_items[500:]:
         channel.remove(extra)
-
-# -----------------------------
-# FlareSolverr helper
-# -----------------------------
-def fetch_via_flaresolverr(url, timeout_ms=FLARE_MAX_TIMEOUT):
-    """Request `url` through FlareSolverr. Returns HTML string on success, else raises.
-
-    Requires FLARE_URL (full endpoint, e.g. http://127.0.0.1:8191/v1).
-    Optionally set FLARE_API_KEY to send X-Api-Key header, and FLARE_SESSION to reuse session cookies.
-    """
-    if not FLARE_URL:
-        raise RuntimeError("FLARE_URL not configured")
-
-    payload = {
-        "cmd": "request.get",
-        "url": url,
-        "maxTimeout": int(timeout_ms),
-    }
-    # optional params
-    if FLARE_SESSION:
-        payload["session"] = FLARE_SESSION
-    # Send a UA to help FlareSolverr behave like a browser
-    payload["userAgent"] = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-
-    headers = {"Content-Type": "application/json"}
-    if FLARE_API_KEY:
-        headers["X-Api-Key"] = FLARE_API_KEY
-
-    resp = requests.post(FLARE_URL, json=payload, headers=headers, timeout=(10, int(timeout_ms / 1000) + 10))
-    resp.raise_for_status()
-    data = resp.json()
-
-    # flaresolverr returns a 'solution' dict with 'response' (string HTML) in typical setups
-    sol = data.get("solution") or {}
-    html = sol.get("response") or sol.get("html") or data.get("response") or data.get("html")
-    if not html:
-        # sometimes the 'solution' contains 'url' and other structure; be defensive
-        raise RuntimeError(f"FlareSolverr returned no HTML for {url}: {data}")
-    return html
-
-def fetch_url_text(url):
-    """Fetch URL text using FlareSolverr if configured, otherwise requests.get()."""
-    if FLARE_URL:
-        return fetch_via_flaresolverr(url)
-    r = requests.get(url, timeout=(5, 30))
-    r.raise_for_status()
-    return r.text
 
 # -----------------------------
 # Print edition logic with tracker
@@ -385,13 +326,7 @@ def add_items_print(entries, paths):
 # MAIN
 # -----------------------------
 def main():
-    # Fetch feed using FlareSolverr when configured
-    try:
-        feed_text = fetch_url_text(SRC)
-        feed = feedparser.parse(feed_text)
-    except Exception:
-        # fallback to direct parse by URL
-        feed = feedparser.parse(SRC)
+    feed = feedparser.parse(SRC)
 
     # Collect all links in print editions
     op_print_links = set()
