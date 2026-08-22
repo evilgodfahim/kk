@@ -2,370 +2,322 @@
 # -*- coding: utf-8 -*-
 
 """
-scrape.py — Kaler Kantho RSS feed scraper.
-Fetches the main RSS feed directly via feedparser and splits entries into
-opinion, world, and print-edition XML files with a JSON tracker for dedup.
+scrape.py — Kaler Kantho opinion section scraper.
+Fetches https://www.kalerkantho.com/online/opinion via FlareSolverr (or
+direct requests as fallback), parses article cards, and merges results
+into opinion.xml (RSS 2.0).
 """
 
 import os
-import json
-import calendar
-import email.utils
-from datetime import datetime, timezone
-
-import feedparser
+import re
 import xml.etree.ElementTree as ET
+from datetime import datetime
 
-# -----------------------------
+import requests
+from bs4 import BeautifulSoup
+
+# ─────────────────────────────────────────
 # CONFIG
-# -----------------------------
-SRC = "https://www.kalerkantho.com/rss.xml"
-FILES = {
-    "opinion": "opinion.xml",
-    "world": "world.xml",
-    "print_parts": ["daily_kalerkantho_part1.xml", "daily_kalerkantho_part2.xml"]
-}
-PRINT_TRACKER = "print_articles_tracker.json"
+# ─────────────────────────────────────────
+OPINION_URL       = "https://www.kalerkantho.com/online/opinion"
+BASE_URL          = "https://www.kalerkantho.com"
+OUTPUT_FILE       = "opinion.xml"
+MAX_ITEMS         = 500
 
-# -----------------------------
-# Utility
-# -----------------------------
+FLARE_URL         = os.environ.get("FLARE_URL", "")
+FLARE_API_KEY     = os.environ.get("FLARE_API_KEY", "")
+FLARE_SESSION     = os.environ.get("FLARE_SESSION", "")
+FLARE_MAX_TIMEOUT = int(os.environ.get("FLARE_MAX_TIMEOUT", "60000"))
+FLARE_WAIT_MS     = int(os.environ.get("FLARE_WAIT_MS", "5000"))
+
+# ─────────────────────────────────────────
+# BENGALI DATE PARSING
+# ─────────────────────────────────────────
+_BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+_BN_MONTHS = {
+    "জানুয়ারি":  1,  "ফেব্রুয়ারি": 2,  "মার্চ":      3,
+    "এপ্রিল":    4,  "মে":          5,  "জুন":        6,
+    "জুলাই":     7,  "আগস্ট":       8,  "সেপ্টেম্বর": 9,
+    "অক্টোবর":  10,  "নভেম্বর":    11,  "ডিসেম্বর":  12,
+}
+
+def parse_bn_date(text):
+    """
+    Parse Bengali date string into a naive datetime (treated as local/Dhaka time).
+
+    Examples:
+      '২১ আগস্ট, ২০২৬ ২১:৩২'  ->  datetime(2026, 8, 21, 21, 32)
+      '১৬ আগস্ট, ২০২৬ ০৮:০৪'  ->  datetime(2026, 8, 16,  8,  4)
+    """
+    if not text:
+        return None
+    # Translate Bengali digits -> ASCII; month name letters are unaffected
+    translated = text.strip().translate(_BN_DIGITS)
+    # Result looks like: "21 আগস্ট, 2026 21:32"
+    m = re.match(r"(\d+)\s+([^,\s]+),\s*(\d{4})\s+(\d{1,2}):(\d{2})", translated)
+    if not m:
+        return None
+    day, month_bn, year, hour, minute = m.groups()
+    month = _BN_MONTHS.get(month_bn)
+    if not month:
+        return None
+    try:
+        return datetime(int(year), month, int(day), int(hour), int(minute))
+    except ValueError:
+        return None
+
+
+def date_from_url(url):
+    """
+    Extract a date-only datetime from a URL of the form
+    /online/opinion/2026/08/19/1727793  ->  datetime(2026, 8, 19)
+    Returns datetime.min on failure.
+    """
+    m = re.search(r"/(\d{4})/(\d{2})/(\d{2})/", url)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    return datetime.min
+
+
+# ─────────────────────────────────────────
+# FETCH
+# ─────────────────────────────────────────
+def _fetch_via_flare(url):
+    """Send a request.get command to FlareSolverr and return the HTML."""
+    effective_timeout = max(FLARE_MAX_TIMEOUT, FLARE_WAIT_MS + 15_000)
+
+    payload = {
+        "cmd":        "request.get",
+        "url":        url,
+        "maxTimeout": effective_timeout,
+        "waitTime":   FLARE_WAIT_MS,   # idle ms after page load before capture
+    }
+    if FLARE_SESSION:
+        payload["session"] = FLARE_SESSION
+
+    headers = {"Content-Type": "application/json"}
+    if FLARE_API_KEY:
+        headers["X-Api-Key"] = FLARE_API_KEY
+
+    resp = requests.post(
+        FLARE_URL,
+        json=payload,
+        headers=headers,
+        timeout=(10, effective_timeout // 1000 + 10),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    sol  = data.get("solution") or {}
+    html = (
+        sol.get("response")
+        or sol.get("html")
+        or data.get("response")
+        or data.get("html")
+    )
+    if not html:
+        raise RuntimeError(f"FlareSolverr returned no HTML for {url}: {data}")
+    return html
+
+
+def fetch_html(url):
+    """Fetch page HTML. Uses FlareSolverr when FLARE_URL is set, else direct GET."""
+    if FLARE_URL:
+        return _fetch_via_flare(url)
+
+    r = requests.get(
+        url,
+        timeout=(5, 30),
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        },
+    )
+    r.raise_for_status()
+    return r.text
+
+
+# ─────────────────────────────────────────
+# PARSE
+# ─────────────────────────────────────────
+def parse_articles(html):
+    """
+    Parse opinion article cards from the KK opinion page.
+
+    Card structure (div.row.position-relative):
+      <img alt="TITLE" src="IMAGE_URL" ...>
+      <h1|h3>TITLE</h1|h3>               <- fallback for title
+      <p class="homeSubDesc">EXCERPT</p>  <- lead card only
+      <div class="text-muted small ...">EXCERPT</div>
+      <small class="text-muted">BENGALI DATE</small>
+      <a class="stretched-link" href="/online/opinion/YYYY/MM/DD/ID"></a>
+    """
+    soup     = BeautifulSoup(html, "html.parser")
+    articles = []
+    seen     = set()
+
+    cards = soup.find_all("div", class_=lambda c: c and "position-relative" in c)
+
+    for card in cards:
+        # link
+        link_tag = card.find("a", class_="stretched-link")
+        if not link_tag:
+            continue
+        href = link_tag.get("href", "").strip()
+        if "/online/opinion/" not in href:
+            continue
+        full_url = (BASE_URL + href) if href.startswith("/") else href
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+
+        # title: prefer img alt, fall back to heading text
+        img   = card.find("img")
+        title = (img.get("alt", "").strip() if img else "")
+        if not title:
+            for tag in ("h1", "h2", "h3"):
+                h = card.find(tag)
+                if h:
+                    title = h.get_text(strip=True)
+                    break
+
+        # description
+        desc = ""
+        p    = card.find("p", class_="homeSubDesc")
+        if p:
+            desc = p.get_text(strip=True)
+        else:
+            d = card.find(
+                "div",
+                class_=lambda c: c and "text-muted" in c and "small" in c,
+            )
+            if d:
+                desc = d.get_text(strip=True)
+
+        # publication date
+        pub_dt = None
+        sm = card.find("small", class_="text-muted")
+        if sm:
+            pub_dt = parse_bn_date(sm.get_text(strip=True))
+        if pub_dt is None:
+            # Lead card has no <small>; extract date from URL
+            pub_dt = date_from_url(href)
+
+        # image
+        img_src = (img.get("src", "").strip() if img else "")
+
+        articles.append({
+            "title":   title,
+            "link":    full_url,
+            "desc":    desc,
+            "pub_dt":  pub_dt,
+            "img_src": img_src,
+        })
+
+    return articles
+
+
+# ─────────────────────────────────────────
+# RSS HELPERS
+# ─────────────────────────────────────────
+def format_pubdate(dt):
+    if not isinstance(dt, datetime) or dt == datetime.min:
+        return "Thu, 01 Jan 1970 00:00:00 GMT"
+    return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
 def load_existing(path):
-    """Load existing RSS file if present, else create new rss/channel root."""
+    """Load existing RSS file, or create a blank rss/channel skeleton."""
     if os.path.exists(path):
         try:
-            tree = ET.parse(path)
-            return tree.getroot()
+            return ET.parse(path).getroot()
         except Exception:
-            # fall through and create blank structure
             pass
     root = ET.Element("rss", version="2.0")
     ET.SubElement(root, "channel")
     return root
 
-def format_pubdate(dt):
-    # Accept naive datetime (UTC) or datetime.min
-    if not isinstance(dt, datetime) or dt == datetime.min:
-        return "Thu, 01 Jan 1970 00:00:00 GMT"
-    return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
-def parse_struct_time(st):
-    # st is time.struct_time from feedparser; produce naive UTC datetime
-    return datetime.fromtimestamp(calendar.timegm(st), timezone.utc).replace(tzinfo=None)
-
-def get_entry_pubdt(entry):
-    pp = getattr(entry, "published_parsed", None)
-    if pp:
-        try:
-            return parse_struct_time(pp)
-        except Exception:
-            pass
-    ps = getattr(entry, "published", None)
-    if ps:
-        try:
-            return email.utils.parsedate_to_datetime(ps).replace(tzinfo=None)
-        except Exception:
-            pass
-    return datetime.utcnow()
-
-def get_item_pubdt(item):
-    txt = item.findtext("pubDate")
-    if not txt:
-        return datetime.min
-    try:
-        return email.utils.parsedate_to_datetime(txt).replace(tzinfo=None)
-    except Exception:
-        try:
-            return datetime.strptime(txt, "%a, %d %b %Y %H:%M:%S GMT")
-        except Exception:
-            return datetime.min
-
-def merge_update_feed(root, entries):
+def merge_articles(root, articles):
+    """
+    Merge newly scraped articles into the existing RSS channel.
+    - New articles are inserted at the top.
+    - Existing articles get their pubDate updated if we scraped a newer one
+      (e.g. lead card has a precise time; a previous run may have only had
+      the URL date with no time component).
+    - Channel is capped at MAX_ITEMS, dropping oldest entries.
+    """
     channel = root.find("channel")
+
+    # Index existing items by link for O(1) lookup
     existing = {}
-
     for item in channel.findall("item"):
-        link = item.findtext("link")
-        if link:
-            existing[link] = item
+        lnk = (item.findtext("link") or "").strip()
+        if lnk:
+            existing[lnk] = item
 
-    for entry in entries:
-        link = getattr(entry, "link", None) or getattr(entry, "id", None)
-        if not link:
-            continue
-        link = link.strip()
-        incoming_dt = get_entry_pubdt(entry)
+    for art in articles:
+        link = art["link"]
 
         if link in existing:
-            item = existing[link]
-            if incoming_dt > get_item_pubdt(item):
-                # update fields, keep item order by removing & inserting at top
-                title_el = item.find("title")
-                if title_el is None:
-                    ET.SubElement(item, "title").text = getattr(entry, "title", "")
-                else:
-                    title_el.text = getattr(entry, "title", title_el.text)
+            # Update pubDate only if the new one is strictly better
+            item   = existing[link]
+            old_pd = item.findtext("pubDate") or ""
+            try:
+                old_dt = datetime.strptime(old_pd, "%a, %d %b %Y %H:%M:%S GMT")
+            except ValueError:
+                old_dt = datetime.min
 
+            if art["pub_dt"] and art["pub_dt"] > old_dt:
                 pd_el = item.find("pubDate")
-                if pd_el is None:
-                    ET.SubElement(item, "pubDate").text = format_pubdate(incoming_dt)
-                else:
-                    pd_el.text = getattr(entry, "published", format_pubdate(incoming_dt))
-
-                guid_el = item.find("guid")
-                if guid_el is None:
-                    ET.SubElement(item, "guid", isPermaLink="false").text = link
-                else:
-                    guid_el.text = link
-
+                if pd_el is not None:
+                    pd_el.text = format_pubdate(art["pub_dt"])
+                # Re-insert at top to keep channel sorted by recency
                 channel.remove(item)
                 channel.insert(0, item)
         else:
             item = ET.Element("item")
-            ET.SubElement(item, "title").text = getattr(entry, "title", "")
-            ET.SubElement(item, "link").text = link
-            ET_Sub = ET.SubElement(item, "pubDate")
-            ET_Sub.text = getattr(entry, "published", format_pubdate(incoming_dt))
-            ET.SubElement(item, "guid", isPermaLink="false").text = link
+            ET.SubElement(item, "title").text       = art["title"]
+            ET.SubElement(item, "link").text        = link
+            ET.SubElement(item, "description").text = art["desc"]
+            ET.SubElement(item, "pubDate").text     = format_pubdate(art["pub_dt"])
+            ET.SubElement(item, "guid", isPermaLink="true").text = link
+            if art["img_src"]:
+                enc = ET.SubElement(item, "enclosure")
+                enc.set("url",    art["img_src"])
+                enc.set("type",   "image/jpeg")
+                enc.set("length", "0")
             channel.insert(0, item)
             existing[link] = item
 
-    # Cap at 500 items
+    # Enforce cap — drop oldest (tail) items
     all_items = channel.findall("item")
-    for extra in all_items[500:]:
+    for extra in all_items[MAX_ITEMS:]:
         channel.remove(extra)
 
-# -----------------------------
-# Print edition logic with tracker
-# -----------------------------
-def normalize_link(link):
-    if not link:
-        return ""
-    link = link.strip()
-    link = link.split("?", 1)[0].split("#", 1)[0]
-    return link.rstrip("/")
 
-def load_tracker():
-    if os.path.exists(PRINT_TRACKER):
-        try:
-            with open(PRINT_TRACKER, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-def save_tracker(tracker):
-    with open(PRINT_TRACKER, 'w', encoding='utf-8') as f:
-        json.dump(tracker, f, ensure_ascii=False, indent=2)
-
-def add_items_print(entries, paths):
-    tracker = load_tracker()
-
-    # Load existing items from both XMLs and update tracker
-    for idx, p in enumerate(paths):
-        if not os.path.exists(p):
-            continue
-        try:
-            root = ET.parse(p).getroot()
-        except Exception:
-            continue
-        ch = root.find("channel")
-        if ch is None:                          # FIX: was `if not ch:`
-            continue
-        for item in ch.findall("item"):
-            link = normalize_link(item.findtext("link") or "")
-            if not link:
-                continue
-            title = item.findtext("title") or ""
-            pd_text = item.findtext("pubDate") or ""
-            try:
-                pd = email.utils.parsedate_to_datetime(pd_text).replace(tzinfo=None)
-            except Exception:
-                try:
-                    pd = datetime.strptime(pd_text, "%a, %d %b %Y %H:%M:%S GMT")
-                except Exception:
-                    pd = datetime.min
-
-            # If link already in tracker, keep its original file assignment
-            if link not in tracker:
-                tracker[link] = {
-                    "file_index": idx,
-                    "title": title,
-                    "pubDate": pd.isoformat()
-                }
-            else:
-                # Update title and pubDate if newer, but keep file_index
-                try:
-                    existing_pd = datetime.fromisoformat(tracker[link]["pubDate"])
-                    if pd > existing_pd:
-                        tracker[link]["title"] = title
-                        tracker[link]["pubDate"] = pd.isoformat()
-                except Exception:
-                    pass
-
-    # Process new entries from feed
-    new_articles = []
-    for e in entries:
-        raw = getattr(e, "link", None) or getattr(e, "id", None) or ""
-        link = normalize_link(raw)
-        if not link:
-            continue
-
-        # Only add if NOT already in tracker (truly new article)
-        if link not in tracker:
-            pd = get_entry_pubdt(e)
-            title = getattr(e, "title", "")
-            new_articles.append({
-                "link": link,
-                "title": title,
-                "pubDate": pd
-            })
-
-    # Sort new articles by date (newest first)
-    new_articles.sort(key=lambda x: x["pubDate"], reverse=True)
-
-    # Assign new articles to files
-    # Count current items in each file
-    file_counts = [0, 0]
-    for link, data in tracker.items():
-        file_idx = data.get("file_index", 0)
-        if file_idx < len(file_counts):
-            file_counts[file_idx] += 1
-
-    # Add new articles - fill part1 first (up to 100), rest go to part2
-    for article in new_articles:
-        if file_counts[0] < 100:
-            target_file = 0
-        else:
-            target_file = 1
-
-        tracker[article["link"]] = {
-            "file_index": target_file,
-            "title": article["title"],
-            "pubDate": article["pubDate"].isoformat()
-        }
-        file_counts[target_file] += 1
-
-    # Build items for each file from tracker
-    file_items = [[], []]
-    for link, data in tracker.items():
-        file_idx = data.get("file_index", 0)
-        if file_idx < len(file_items):
-            try:
-                pd = datetime.fromisoformat(data["pubDate"])
-            except Exception:
-                pd = datetime.min
-            file_items[file_idx].append({
-                "link": link,
-                "title": data["title"],
-                "pubDate": pd
-            })
-
-    # Sort each file's items by date (newest first) and cap at 500 total
-    for items in file_items:
-        items.sort(key=lambda x: x["pubDate"], reverse=True)
-
-    # Apply 500 item cap across both files (remove oldest)
-    all_tracked = []
-    for idx, items in enumerate(file_items):
-        for item in items:
-            all_tracked.append((item, idx))
-
-    all_tracked.sort(key=lambda x: x[0]["pubDate"], reverse=True)
-
-    if len(all_tracked) > 500:
-        # Remove oldest items from tracker
-        for item_data, file_idx in all_tracked[500:]:
-            link = item_data["link"]
-            if link in tracker:
-                del tracker[link]
-
-        # Rebuild file_items after cleanup
-        file_items = [[], []]
-        for link, data in tracker.items():
-            file_idx = data.get("file_index", 0)
-            if file_idx < len(file_items):
-                try:
-                    pd = datetime.fromisoformat(data["pubDate"])
-                except Exception:
-                    pd = datetime.min
-                file_items[file_idx].append({
-                    "link": link,
-                    "title": data["title"],
-                    "pubDate": pd
-                })
-
-        for items in file_items:
-            items.sort(key=lambda x: x["pubDate"], reverse=True)
-
-    # Write files
-    def write_part(path, chunk):
-        root = ET.Element("rss", version="2.0")
-        ch = ET.SubElement(root, "channel")
-        for it in chunk:
-            item = ET.SubElement(ch, "item")
-            ET.SubElement(item, "title").text = it["title"]
-            ET.SubElement(item, "link").text = it["link"]
-            ET.SubElement(item, "pubDate").text = format_pubdate(it["pubDate"])
-            ET.SubElement(item, "guid", isPermaLink="false").text = it["link"]
-        ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
-
-    for idx, path in enumerate(paths):
-        write_part(path, file_items[idx])
-
-    # Save tracker
-    save_tracker(tracker)
-
-    # Remove extra old part files if any
-    for j in range(2, 10):  # Check up to 10 potential old files
-        old_path = f"daily_kalerkantho_part{j+1}.xml"
-        if os.path.exists(old_path):
-            os.remove(old_path)
-
-# -----------------------------
+# ─────────────────────────────────────────
 # MAIN
-# -----------------------------
+# ─────────────────────────────────────────
 def main():
-    feed = feedparser.parse(SRC)
+    print(f"Fetching {OPINION_URL} ...")
+    html = fetch_html(OPINION_URL)
 
-    # Collect all links in print editions
-    op_print_links = set()
-    for p in FILES["print_parts"]:
-        if os.path.exists(p):
-            try:
-                root_tmp = ET.parse(p).getroot()
-                ch_tmp = root_tmp.find("channel")
-                if ch_tmp is not None:              # FIX: was `if ch_tmp:`
-                    for it in ch_tmp.findall("item"):
-                        ln = it.findtext("link")
-                        if ln:
-                            op_print_links.add(ln.strip())
-            except Exception:
-                continue
+    articles = parse_articles(html)
+    print(f"Parsed {len(articles)} opinion articles")
 
-    # Opinion feed (exclude print edition links)
-    op_root = load_existing(FILES["opinion"])
-    op_entries = [
-        e for e in feed.entries
-        if any(x in (getattr(e, "link", "") or "") for x in ["/opinion/","/editorial/","/sub-editorial/"])
-        and (getattr(e, "link", "") or "").strip() not in op_print_links
-    ]
-    merge_update_feed(op_root, op_entries)
-    ET.ElementTree(op_root).write(FILES["opinion"], encoding="utf-8", xml_declaration=True)
+    root = load_existing(OUTPUT_FILE)
+    merge_articles(root, articles)
 
-    # World feed (exclude print edition links)
-    wr_root = load_existing(FILES["world"])
-    wr_entries = [
-        e for e in feed.entries
-        if any(x in (getattr(e, "link", "") or "") for x in ["/world/","/deshe-deshe/"])
-        and (getattr(e, "link", "") or "").strip() not in op_print_links
-    ]
-    merge_update_feed(wr_root, wr_entries)
-    ET.ElementTree(wr_root).write(FILES["world"], encoding="utf-8", xml_declaration=True)
+    ET.ElementTree(root).write(OUTPUT_FILE, encoding="utf-8", xml_declaration=True)
+    print(f"Saved -> {OUTPUT_FILE}")
 
-    # Print edition
-    print_entries = [e for e in feed.entries if "/print-edition/" in (getattr(e,"link","") or "")]
-    add_items_print(print_entries, FILES["print_parts"])
 
 if __name__ == "__main__":
     main()
